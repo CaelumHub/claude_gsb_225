@@ -13,16 +13,15 @@ Pages (10) are rendered from the ``templates/`` directory; the API lives under
 from __future__ import annotations
 
 import base64
-import io
 import math
 import os
 import shutil
 import tempfile
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import analysis, audio_io, batch, chords, effects, mixer, processing, realtime, separation, storage
 
 try:
     from flask_cors import CORS
@@ -40,6 +39,7 @@ if _CORS:
     CORS(app)
 
 store = storage.Storage(DATA_DIR)
+batches = batch.BatchManager(store)
 rt = realtime.new_analyzer()
 
 
@@ -58,25 +58,7 @@ def _entry(file_id: str) -> Optional[Dict]:
 def _register_derived(source_id: str, name: str, wav_path: str,
                       extra: Optional[Dict] = None) -> Dict:
     """Register a newly-created audio file that derives from ``source_id``."""
-    file_id = storage.new_id()
-    dst = os.path.join(store.audio_dir, file_id + ".wav")
-    if wav_path != dst:
-        shutil.move(wav_path, dst)
-    with audio_io.WavReader(dst) as r:
-        sr, ch, frames = r.sr, r.channels, r.nframes
-    entry = {
-        "id": file_id,
-        "name": name,
-        "path": f"audio/{file_id}.wav",
-        "sr": sr,
-        "channels": ch,
-        "frames": frames,
-        "duration": frames / sr if sr else 0.0,
-        "size_bytes": os.path.getsize(dst),
-        "derived_from": source_id,
-    }
-    entry.update(extra or {})
-    return store.add_file(entry)
+    return processing.register_wav(store, source_id, name, wav_path, extra)
 
 
 # --------------------------------------------------------------------------- #
@@ -305,77 +287,6 @@ def api_samples(file_id: str):
 # Waveform edits
 # --------------------------------------------------------------------------- #
 
-def _apply_edit(src_path: str, dst_path: str, op: str, params: Dict) -> None:
-    """Streaming waveform edit: trim / silence / fade / gain / normalize / reverse."""
-    with audio_io.WavReader(src_path) as r:
-        sr = r.sr
-        ch = r.channels
-        total = r.nframes
-
-        if op == "reverse":
-            bufs = [[] for _ in range(ch)]
-            for chunk in r.iter_chunks():
-                for c, ch_data in enumerate(chunk):
-                    bufs[c].extend(ch_data)
-            with audio_io.WavWriter(dst_path, sr, ch, 2) as w:
-                w.write_chunk([b[::-1] for b in bufs])
-            return
-
-        start_f = int(float(params.get("start", 0)) * sr)
-        end_f = int(float(params.get("end", total / sr)) * sr)
-        start_f = max(0, min(start_f, total))
-        end_f = max(start_f, min(end_f, total))
-
-        gain = 10.0 ** (float(params.get("gain_db", 0)) / 20.0)
-        fade_in = float(params.get("fade_in", 0)) * sr
-        fade_out = float(params.get("fade_out", 0)) * sr
-
-        # Normalise needs a peak pre-scan.
-        if op == "normalize":
-            peak = 0.0
-            with audio_io.WavReader(src_path) as rr:
-                for chunk in rr.iter_chunks():
-                    for c in chunk:
-                        for v in c:
-                            a = abs(v)
-                            if a > peak:
-                                peak = a
-            gain = (float(params.get("peak", 0.99)) / peak) if peak > 1e-9 else 1.0
-            op = "gain"
-
-        with audio_io.WavWriter(dst_path, sr, ch, 2) as w:
-            pos = 0
-            while True:
-                chunk = r.read_chunk(1 << 16)
-                if chunk is None:
-                    break
-                n = len(chunk[0])
-                out = []
-                for c in chunk:
-                    o = []
-                    for i, v in enumerate(c):
-                        gpos = pos + i
-                        x = v
-                        if op == "gain":
-                            x = x * gain
-                        if op == "trim":
-                            if gpos < start_f or gpos >= end_f:
-                                x = 0.0
-                        if op == "silence":
-                            if start_f <= gpos < end_f:
-                                x = 0.0
-                        if op == "fade":
-                            if fade_in > 0 and gpos < fade_in:
-                                x *= gpos / fade_in
-                            if fade_out > 0 and gpos >= total - fade_out:
-                                x *= (total - gpos) / fade_out
-                        o.append(x)
-                    out.append(o)
-                w.write_chunk(out)
-                pos += n
-        return
-
-
 @app.post("/api/audio/<file_id>/edit")
 def api_edit(file_id: str):
     entry = _entry(file_id)
@@ -387,7 +298,7 @@ def api_edit(file_id: str):
 
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
-    _apply_edit(_abs_path(entry), dst, op, data.get("params", {}))
+    processing.apply_edit(_abs_path(entry), dst, op, data.get("params", {}))
     new_entry = _register_derived(entry["id"], name, dst, {"op": op})
     return jsonify(new_entry)
 
@@ -522,7 +433,7 @@ def api_effects_apply():
 
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
-    effects.apply_chain_to_file(_abs_path(entry), dst, chain)
+    processing.apply_effects(_abs_path(entry), dst, chain)
     new_entry = _register_derived(entry["id"], name, dst, {"effects": chain})
     return jsonify(new_entry)
 
@@ -603,53 +514,24 @@ def api_export():
     channels = data.get("channels")
     bitrate = data.get("bitrate", "192k")
 
-    ext = fmt
-    file_id_new = storage.new_id()
-    dst = os.path.join(store.audio_dir, file_id_new + "." + ext)
-    audio_io.convert(_abs_path(entry), dst, fmt, dst_sr=dst_sr,
-                     sample_width=sample_width, channels=channels, bitrate=bitrate)
+    if fmt in ("mp3", "ogg", "m4a", "aiff", "flac") and not audio_io.has_ffmpeg():
+        return jsonify(error=f"导出 {fmt.upper()} 需要 ffmpeg，但服务器未安装"), 400
 
-    # Read back what we can about the exported file.
-    sr, ch, frames, duration, size = _probe(dst, fmt)
-    entry = store.add_file({
-        "id": file_id_new,
-        "name": f"{entry['name'].rsplit('.', 1)[0]}.{ext}",
-        "original_format": fmt,
-        "path": f"audio/{file_id_new}.{ext}",
-        "sr": sr,
-        "channels": ch,
-        "frames": frames,
-        "duration": duration,
-        "size_bytes": size,
-        "derived_from": file_id,
-        "exported": True,
-    })
-    return jsonify(entry)
-
-
-def _probe(path: str, fmt: str):
-    """Best-effort metadata probe for an exported file (ffmpeg for compressed)."""
-    if fmt == "wav":
-        try:
-            with audio_io.WavReader(path) as r:
-                return r.sr, r.channels, r.nframes, r.duration, os.path.getsize(path)
-        except Exception:
-            pass
-    size = os.path.getsize(path)
-    # Use ffprobe if available for duration.
+    # Render to a scratch file first; only a finished export enters the library.
+    fd, tmp = tempfile.mkstemp(suffix="." + fmt)
+    os.close(fd)
+    os.unlink(tmp)
     try:
-        import subprocess
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries",
-             "stream=sample_rate,channels:format=duration",
-             "-of", "json", path], capture_output=True, timeout=60)
-        import json
-        info = json.loads(out.stdout)
-        st = info.get("streams", [{}])[0]
-        dur = float(info.get("format", {}).get("duration", 0) or 0)
-        return int(st.get("sample_rate", 0) or 0), int(st.get("channels", 0) or 0), 0, dur, size
+        processing.export_file(_abs_path(entry), tmp, fmt, dst_sr=dst_sr,
+                               sample_width=sample_width, channels=channels,
+                               bitrate=bitrate)
+        name_base = entry["name"].rsplit(".", 1)[0]
+        new_entry = processing.register_exported(store, file_id, name_base, tmp, fmt)
+        return jsonify(new_entry)
     except Exception:
-        return 0, 0, 0, 0.0, size
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -687,6 +569,74 @@ def api_file_versions(file_id: str):
         parent = cur.get("derived_from")
         cur = _entry(parent) if parent else None
     return jsonify(chain)
+
+
+# --------------------------------------------------------------------------- #
+# Batch processing
+# --------------------------------------------------------------------------- #
+
+@app.post("/api/batch")
+def api_batch_create():
+    """Queue a batch job: one operation applied to many files.
+
+    Body: {"operation": effects|export|edit, "params": {...}, "file_ids": [...]}
+    Returns the created job (with per-item state) immediately; progress is polled
+    via GET /api/batch/<id>.
+    """
+    data = request.get_json(force=True) or {}
+    operation = data.get("operation")
+    params = data.get("params") or {}
+    file_ids: List[str] = data.get("file_ids") or []
+    if not isinstance(file_ids, list) or not file_ids:
+        return jsonify(error="请至少选择一个文件"), 400
+
+    # Resolve every id up-front so an unknown id fails the whole submission
+    # rather than being reported as 30 individual "file not found" rows.
+    entries = []
+    missing = []
+    for fid in file_ids:
+        e = _entry(fid)
+        if e:
+            entries.append(e)
+        else:
+            missing.append(fid)
+    if missing:
+        return jsonify(error=f"部分文件已不存在: {', '.join(missing[:5])}"), 404
+
+    try:
+        job = batches.create_job(operation, params, entries)
+    except batch.BatchError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(job), 201
+
+
+@app.get("/api/batch")
+def api_batch_list():
+    return jsonify(batches.list_jobs())
+
+
+@app.get("/api/batch/active")
+def api_batch_active():
+    job = batches.active_job()
+    if not job:
+        return jsonify(None), 204
+    return jsonify(job)
+
+
+@app.get("/api/batch/<job_id>")
+def api_batch_get(job_id: str):
+    job = batches.get_job(job_id)
+    if not job:
+        return jsonify(error="batch job not found"), 404
+    return jsonify(job)
+
+
+@app.post("/api/batch/<job_id>/cancel")
+def api_batch_cancel(job_id: str):
+    job = batches.cancel_job(job_id)
+    if not job:
+        return jsonify(error="batch job not found"), 404
+    return jsonify(job)
 
 
 # --------------------------------------------------------------------------- #
