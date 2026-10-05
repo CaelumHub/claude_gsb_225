@@ -390,3 +390,44 @@ tr:hover td { background: var(--bg-raised); }
 
 details.help { font-size: 12px; color: var(--text-muted); margin-top: 8px; }
 details.help summary { cursor: pointer; color: var(--accent); }
+
+/* Batch processing --------------------------------------------------------- */
+
+tr.row-selected td { background: var(--accent-soft); }
+
+.batch-pane {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  margin-top: 12px;
+  background: var(--bg-raised);
+}
+
+.batch-items {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-top: 10px;
+}
+
+.batch-item {
+  display: grid;
+  grid-template-columns: minmax(140px, 1.6fr) 80px 2fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.batch-item:last-child { border-bottom: none; }
+.batch-item .bi-name {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.batch-item .bi-progress { height: 5px; border-radius: 3px; background: var(--bg-inset); overflow: hidden; }
+.batch-item .bi-progress > span { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+.batch-item.success .bi-progress > span { background: var(--green); }
+.batch-item.failed .bi-progress > span { background: var(--red); }
+.batch-item.cancelled .bi-progress > span { background: var(--text-faint); }
+.batch-item .bi-error { color: var(--red); font-size: 11px; grid-column: 3 / 5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.batch-item .bi-result a { font-size: 11px; }

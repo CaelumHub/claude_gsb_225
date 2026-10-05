@@ -33,6 +33,15 @@ from typing import Generator, List, Optional, Sequence, Tuple
 
 from . import dsp
 
+
+class ProcessingCancelled(Exception):
+    """Raised inside a streaming pipeline when the user cancelled the job.
+
+    Defined here (the lowest streaming layer) so both :mod:`effects` and
+    :mod:`batch` can cancel without an import cycle.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Data model
 # --------------------------------------------------------------------------- #
@@ -405,41 +414,66 @@ WAV_SAMPLE_WIDTHS = {"pcm16": 2, "pcm24": 3, "pcm8": 1, "float32": 4}
 
 def convert(src_path: str, dst_path: str, fmt: str, dst_sr: Optional[int] = None,
             sample_width: str = "pcm16", channels: Optional[int] = None,
-            bitrate: str = "192k") -> str:
+            bitrate: str = "192k", on_progress=None, is_cancelled=None) -> str:
     """Convert ``src_path`` to ``dst_path`` in the requested format.
 
     ``fmt`` is one of: wav, aiff, raw, mp3, ogg, flac, m4a.
+
+    ``on_progress(frac)`` is called while streaming / encoding and
+    ``is_cancelled()`` polled between chunks; raising/cancelling removes the
+    partial output so no half-finished artefact is left behind.
     """
-    # Normalise the source to a WAV first (in case it is compressed).
+    # Every library file is a normalised WAV already, but tolerate other inputs.
     src_wav = src_path if src_path.lower().endswith(".wav") else decode_with_ffmpeg(src_path)
 
     if fmt == "wav":
-        return _convert_wav(src_wav, dst_path, dst_sr, sample_width, channels)
+        try:
+            return _convert_wav(src_wav, dst_path, dst_sr, sample_width, channels,
+                                on_progress=on_progress, is_cancelled=is_cancelled)
+        except ProcessingCancelled:
+            _safe_unlink(dst_path)
+            raise
     if fmt == "aiff":
-        return _convert_aiff(src_wav, dst_path, dst_sr, channels)
+        return _ffmpeg_export(src_wav, dst_path, "aiff", dst_sr, channels, bitrate,
+                              on_progress=on_progress, is_cancelled=is_cancelled)
     if fmt == "raw":
-        return _convert_raw(src_wav, dst_path, dst_sr, channels)
+        try:
+            return _convert_raw(src_wav, dst_path, dst_sr, channels)
+        except ProcessingCancelled:
+            _safe_unlink(dst_path)
+            raise
     if fmt in ("mp3", "ogg", "flac", "m4a"):
         # ffmpeg handles resample/channel mixdown itself via the output spec.
-        tmp = src_wav
-        if dst_sr or channels:
-            fd, tmp = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-            _convert_wav(src_wav, tmp, dst_sr, "pcm16", channels)
-        return encode_with_ffmpeg(tmp, dst_path, fmt, bitrate)
+        return _ffmpeg_export(src_wav, dst_path, fmt, dst_sr, channels, bitrate,
+                              on_progress=on_progress, is_cancelled=is_cancelled)
     raise ValueError(f"unknown format {fmt}")
 
 
+def _safe_unlink(path: str) -> None:
+    try:
+        if os.path.isfile(path):
+            os.unlink(path)
+    except OSError:
+        pass
+
+
 def _convert_wav(src_wav: str, dst_path: str, dst_sr: Optional[int],
-                 sample_width: str, channels: Optional[int]) -> str:
+                 sample_width: str, channels: Optional[int],
+                 on_progress=None, is_cancelled=None) -> str:
     sw = WAV_SAMPLE_WIDTHS.get(sample_width, 2)
     with WavReader(src_wav) as r:
+        total = max(1, r.nframes)
         sr = dst_sr or r.sr
         ch = channels or r.channels
+        if ch > r.channels:
+            raise ValueError(f"source has {r.channels} channels; cannot upmix to {ch}")
         need_resample = bool(dst_sr and dst_sr != r.sr)
         resamplers = [dsp.StreamingResampler(r.sr, sr) for _ in range(ch)]
+        done = 0
         with WavWriter(dst_path, sr, ch, sw) as out:
             for chunk in r.iter_chunks():
+                if is_cancelled and is_cancelled():
+                    raise ProcessingCancelled("cancelled")
                 c = [list(x) for x in chunk[:ch]]
                 if need_resample:
                     out_ch = []
@@ -448,29 +482,93 @@ def _convert_wav(src_wav: str, dst_path: str, dst_sr: Optional[int],
                         out_ch.append(rs.pull(len(c[i])))
                     c = out_ch
                 out.write_chunk(c)
+                done += len(c[0])
+                if on_progress:
+                    on_progress(min(0.99, done / total))
             # Flush the resampler's trailing samples.
             if need_resample:
                 tail = [rs.flush(1 << 20) for rs in resamplers]
                 if any(tail):
                     m = min(len(t) for t in tail)
                     out.write_chunk([t[:m] for t in tail])
+        if on_progress:
+            on_progress(1.0)
     return dst_path
 
 
-def _convert_aiff(src_wav: str, dst_path: str, dst_sr: Optional[int],
-                  channels: Optional[int]) -> str:
-    # ffmpeg is the simplest reliable AIFF encoder; fall back to copying via
-    # a temporary WAV first if ffmpeg is missing.
-    if has_ffmpeg():
-        extra = []
-        if dst_sr:
-            extra += ["-ar", str(dst_sr)]
-        if channels:
-            extra += ["-ac", str(channels)]
-        subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", src_wav]
-                       + extra + [dst_path], check=True, capture_output=True, timeout=600)
-        return dst_path
-    raise RuntimeError("ffmpeg required for AIFF export")
+def _ffmpeg_export(src_wav: str, dst_path: str, fmt: str,
+                   dst_sr: Optional[int], channels: Optional[int],
+                   bitrate: str = "192k", on_progress=None,
+                   is_cancelled=None) -> str:
+    """Encode via ffmpeg, streaming its ``-progress`` output for the UI.
+
+    The child process is killed when ``is_cancelled()`` becomes true and the
+    partial output is removed, so cancellation never leaves a half file.
+    """
+    if not has_ffmpeg():
+        raise RuntimeError("ffmpeg not found — cannot encode this format")
+    codec_map = {
+        "mp3": ["-acodec", "libmp3lame", "-b:a", bitrate],
+        "ogg": ["-acodec", "libvorbis", "-q:a", "4"],
+        "flac": ["-acodec", "flac"],
+        "m4a": ["-acodec", "aac", "-b:a", bitrate],
+        "aiff": ["-acodec", "pcm_s16be"],
+    }
+    if fmt not in codec_map:
+        raise ValueError(f"unsupported ffmpeg format {fmt}")
+
+    total = 0.0
+    try:
+        with WavReader(src_wav) as r:
+            total = r.duration
+    except Exception:
+        pass
+
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
+           "-progress", "pipe:2", "-i", src_wav]
+    if dst_sr:
+        cmd += ["-ar", str(dst_sr)]
+    if channels:
+        cmd += ["-ac", str(channels)]
+    cmd += codec_map[fmt] + [dst_path]
+
+    import threading
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True)
+    cancelled = {"v": False}
+
+    def _watch():
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            line = line.strip()
+            if on_progress and line.startswith("out_time_ms=") and total > 0:
+                try:
+                    us = int(line.split("=", 1)[1])
+                    on_progress(min(0.99, (us / 1_000_000) / total))
+                except ValueError:
+                    pass
+
+    reader = threading.Thread(target=_watch, daemon=True)
+    reader.start()
+    while True:
+        try:
+            rc = proc.wait(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            if is_cancelled and is_cancelled():
+                cancelled["v"] = True
+                proc.kill()
+                proc.wait()
+                reader.join(timeout=1)
+                _safe_unlink(dst_path)
+                raise ProcessingCancelled("cancelled")
+    reader.join(timeout=1)
+    if rc != 0:
+        _safe_unlink(dst_path)
+        raise RuntimeError(f"ffmpeg encode failed (exit {rc})")
+    if on_progress:
+        on_progress(1.0)
+    return dst_path
 
 
 def _convert_raw(src_wav: str, dst_path: str, dst_sr: Optional[int],

@@ -355,28 +355,49 @@ class EffectChain:
         return None
 
 
-def apply_chain_to_file(src_path: str, dst_path: str, specs: List[Dict]) -> Dict:
+def apply_chain_to_file(src_path: str, dst_path: str, specs: List[Dict],
+                        on_progress=None, is_cancelled=None) -> Dict:
     """Stream the effect chain over a whole file and write the result."""
+    from .audio_io import ProcessingCancelled
+
     with audio_io.WavReader(src_path) as r:
         sr = r.sr
+        total = max(1, r.nframes)
         chain = EffectChain(specs, sr)
-        reversed_bufs: List[Optional[List[float]]] = None
         has_reverse = any(e.get("type") == "reverse" and e.get("enabled", True) for e in specs)
 
         if has_reverse:
             # Reverse must buffer the entire signal — handled specially.
             bufs: List[List[float]] = [[] for _ in range(r.channels)]
+            done = 0
             for chunk in r.iter_chunks():
+                if is_cancelled and is_cancelled():
+                    raise ProcessingCancelled("cancelled")
                 for c, ch in enumerate(chunk):
                     bufs[c].extend(ch)
+                done += len(chunk[0])
+                if on_progress:
+                    on_progress(min(0.99, done / total))
+            if is_cancelled and is_cancelled():
+                raise ProcessingCancelled("cancelled")
             with audio_io.WavWriter(dst_path, sr, r.channels, 2) as w:
                 w.write_chunk([bufs[c][::-1] for c in range(r.channels)])
+            if on_progress:
+                on_progress(1.0)
             return {"frames": r.nframes, "reversed": True}
 
+        done = 0
         with audio_io.WavWriter(dst_path, sr, r.channels, 2) as w:
             for chunk in r.iter_chunks():
+                if is_cancelled and is_cancelled():
+                    raise ProcessingCancelled("cancelled")
                 out_ch = chain.process_channels(chunk)
                 w.write_chunk(out_ch)
+                done += len(chunk[0])
+                if on_progress:
+                    on_progress(min(0.99, done / total))
+        if on_progress:
+            on_progress(1.0)
         return {"frames": r.nframes, "reversed": False}
 
 

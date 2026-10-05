@@ -4,7 +4,7 @@
 <div class="main-head">
   <div>
     <h1>音频库</h1>
-    <div class="sub">上传、生成与管理音频文件 — 音频单独存储，元数据保存在 library.json（文件锁保护）</div>
+    <div class="sub">上传、生成与管理音频文件 — 勾选多个文件可一键批量处理（效果链 / 导出 / 编辑），支持中途取消</div>
   </div>
   <div id="stats" class="muted small"></div>
 </div>
@@ -36,10 +36,109 @@
 </div>
 
 <div class="card">
+  <h2>批量处理</h2>
+  <div class="row">
+    <label class="field inline">已选 <strong id="selCount">0</strong> 个文件</label>
+    <label class="field inline">操作
+      <select id="batchOp">
+        <option value="effects">统一加效果链</option>
+        <option value="export">统一导出格式</option>
+        <option value="edit">统一做一步编辑</option>
+      </select>
+    </label>
+    <button class="btn-ghost btn-sm" id="selAll">全选 / 全不选</button>
+    <span class="spacer"></span>
+    <button class="btn-primary" id="startBatch">开始批量处理</button>
+    <button class="btn-ghost btn-sm" id="clearSel">清空选择</button>
+  </div>
+
+  <!-- effects pane -->
+  <div class="batch-pane" id="pane-effects">
+    <label class="field" style="max-width:360px">效果链预设
+      <select id="fxPreset"></select>
+    </label>
+    <div class="faint small mt" id="fxDesc"></div>
+  </div>
+
+  <!-- export pane -->
+  <div class="batch-pane hidden" id="pane-export">
+    <div class="grid cols-4">
+      <label class="field">目标格式
+        <select id="expFmt">
+          <option value="wav">WAV (PCM)</option>
+          <option value="mp3">MP3</option>
+          <option value="ogg">OGG / Vorbis</option>
+          <option value="flac">FLAC</option>
+          <option value="m4a">M4A / AAC</option>
+          <option value="aiff">AIFF</option>
+          <option value="raw">RAW</option>
+        </select>
+      </label>
+      <label class="field">采样率
+        <select id="expSr">
+          <option value="">保持原始</option>
+          <option value="22050">22050</option>
+          <option value="44100">44100</option>
+          <option value="48000">48000</option>
+        </select>
+      </label>
+      <label class="field">位深（仅 WAV）
+        <select id="expBits">
+          <option value="pcm16">16-bit</option>
+          <option value="pcm24">24-bit</option>
+          <option value="pcm8">8-bit</option>
+          <option value="float32">32-bit float</option>
+        </select>
+      </label>
+      <label class="field">声道
+        <select id="expCh">
+          <option value="">保持原始</option>
+          <option value="1">单声道</option>
+          <option value="2">立体声</option>
+        </select>
+      </label>
+    </div>
+  </div>
+
+  <!-- edit pane -->
+  <div class="batch-pane hidden" id="pane-edit">
+    <div class="row">
+      <label class="field inline">编辑步骤
+        <select id="editOp">
+          <option value="gain">增益调整</option>
+          <option value="normalize">响度归一化</option>
+          <option value="fade">淡入 / 淡出</option>
+          <option value="silence">区间静音</option>
+          <option value="reverse">倒放</option>
+        </select>
+      </label>
+      <span id="editFields" class="row"></span>
+    </div>
+  </div>
+</div>
+
+<!-- live batch job panel -->
+<div class="card hidden" id="jobCard">
+  <div class="row between">
+    <h2 style="margin:0">批量任务 <span id="jobOpBadge" class="badge purple"></span></h2>
+    <span class="row">
+      <span id="jobSummary" class="muted small"></span>
+      <button class="btn-danger btn-sm" id="cancelJob">取消任务</button>
+      <button class="btn-ghost btn-sm hidden" id="dismissJob">关闭面板</button>
+    </span>
+  </div>
+  <div class="progress mt"><span id="jobBar" style="width:0"></span></div>
+  <div class="batch-items" id="jobItems"></div>
+</div>
+
+<div class="card">
   <h2>文件列表 <span id="countBadge" class="badge neutral"></span></h2>
   <table>
     <thead>
-      <tr><th>名称</th><th>时长</th><th>采样率</th><th>声道</th><th>大小</th><th>来源</th><th style="width:230px">操作</th></tr>
+      <tr>
+        <th style="width:34px"><input type="checkbox" id="headCheck" title="全选" /></th>
+        <th>名称</th><th>时长</th><th>采样率</th><th>声道</th><th>大小</th><th>来源</th><th style="width:230px">操作</th>
+      </tr>
     </thead>
     <tbody id="fileList"></tbody>
   </table>
@@ -49,6 +148,8 @@
 {% block scripts %}
 <script>
 const drop = $("#drop"), input = $("#fileInput"), list = $("#fileList");
+let FILES = [];
+const SELECTED = new Set();
 
 drop.addEventListener("click", () => input.click());
 input.addEventListener("change", () => { if (input.files[0]) upload(input.files[0]); });
@@ -96,6 +197,7 @@ const SRC_LABEL = {
   upload: { text: "上传", cls: "" },
 };
 function srcBadge(f) {
+  if (f.batch) return `<span class="badge purple">批量</span>`;
   if (f.exported) return `<span class="badge amber">导出</span>`;
   if (f.separation) return `<span class="badge purple">分离</span>`;
   if (f.project_id) return `<span class="badge green">混音</span>`;
@@ -106,13 +208,21 @@ function srcBadge(f) {
 }
 
 async function load() {
-  const files = await API.get("/api/library");
+  FILES = await API.get("/api/library");
   const stats = await API.get("/api/stats");
-  $("#countBadge").textContent = files.length + " 个文件";
+  $("#countBadge").textContent = FILES.length + " 个文件";
   $("#stats").innerHTML =
     `${stats.files} 文件 · ${fmtBytes(stats.total_bytes)} · ${stats.analyses} 分析 · ${stats.projects} 项目`;
-  list.innerHTML = files.map(f => `
-    <tr>
+  // Drop selections whose file no longer exists.
+  for (const id of [...SELECTED]) if (!FILES.some(f => f.id === id)) SELECTED.delete(id);
+  renderList();
+  renderSelCount();
+}
+
+function renderList() {
+  list.innerHTML = FILES.map(f => `
+    <tr class="${SELECTED.has(f.id) ? "row-selected" : ""}" data-fid="${f.id}">
+      <td><input type="checkbox" class="rowCheck" ${SELECTED.has(f.id) ? "checked" : ""} /></td>
       <td class="name">${esc(f.name)}</td>
       <td class="mono">${fmtTime(f.duration)}</td>
       <td class="mono">${f.sr} Hz</td>
@@ -120,14 +230,57 @@ async function load() {
       <td>${fmtBytes(f.size_bytes)}</td>
       <td>${srcBadge(f)}</td>
       <td class="row">
-        <button class="btn-sm" onclick="playFile('${f.id}','${esc(f.name)}')">▶ 播放</button>
-        <button class="btn-sm" onclick="location.href='/waveform?file=${f.id}'">编辑</button>
-        <button class="btn-sm" onclick="location.href='/spectrogram?file=${f.id}'">频谱</button>
+        <button class="btn-sm" data-act="play">▶ 播放</button>
+        <button class="btn-sm" data-act="edit">编辑</button>
+        <button class="btn-sm" data-act="spec">频谱</button>
         <a class="btn btn-sm" href="${API.downloadUrl(f.id)}">下载</a>
-        <button class="btn-sm btn-danger" onclick="del('${f.id}')">删除</button>
+        <button class="btn-sm btn-danger" data-act="del">删除</button>
       </td>
     </tr>`).join("");
+
+  list.querySelectorAll("tr").forEach(tr => {
+    const id = tr.dataset.fid;
+    tr.querySelector(".rowCheck").addEventListener("change", e => {
+      e.stopPropagation();
+      e.target.checked ? SELECTED.add(id) : SELECTED.delete(id);
+      tr.classList.toggle("row-selected", e.target.checked);
+      renderSelCount();
+    });
+    tr.addEventListener("click", e => {
+      if (e.target.closest("a,button,input")) return;
+      const cb = tr.querySelector(".rowCheck");
+      cb.checked = !cb.checked;
+      cb.dispatchEvent(new Event("change"));
+    });
+    tr.querySelector('[data-act="play"]').onclick = () => playFile(id, tr.querySelector(".name").textContent);
+    tr.querySelector('[data-act="edit"]').onclick = () => location.href = "/waveform?file=" + id;
+    tr.querySelector('[data-act="spec"]').onclick = () => location.href = "/spectrogram?file=" + id;
+    tr.querySelector('[data-act="del"]').onclick = () => del(id);
+  });
+  syncHeadCheck();
 }
+
+function syncHeadCheck() {
+  const n = FILES.length;
+  $("#headCheck").checked = n > 0 && SELECTED.size === n;
+}
+
+function renderSelCount() {
+  $("#selCount").textContent = SELECTED.size;
+  syncHeadCheck();
+}
+
+$("#headCheck").addEventListener("change", () => {
+  const on = $("#headCheck").checked;
+  if (on) FILES.forEach(f => SELECTED.add(f.id)); else SELECTED.clear();
+  renderList();
+  renderSelCount();
+});
+$("#selAll").addEventListener("click", () => {
+  $("#headCheck").checked = !$("#headCheck").checked;
+  $("#headCheck").dispatchEvent(new Event("change"));
+});
+$("#clearSel").addEventListener("click", () => { SELECTED.clear(); renderList(); renderSelCount(); });
 
 async function del(id) {
   if (!confirm("确定删除该文件及其分析结果？")) return;
@@ -135,6 +288,206 @@ async function del(id) {
   toast("已删除", "success");
   load();
 }
+
+/* ----------------------------------------------------------- batch config */
+
+$("#batchOp").addEventListener("change", () => {
+  const op = $("#batchOp").value;
+  ["effects", "export", "edit"].forEach(o =>
+    $("#pane-" + o).classList.toggle("hidden", o !== op));
+});
+
+let FX_PRESETS = [];
+async function loadPresets() {
+  if (FX_PRESETS.length) return;
+  FX_PRESETS = await API.get("/api/effects/presets");
+  $("#fxPreset").innerHTML = FX_PRESETS.map((p, i) =>
+    `<option value="${i}">${esc(p.name)}</option>`).join("");
+  $("#fxPreset").dispatchEvent(new Event("change"));
+}
+$("#fxPreset").addEventListener("change", () => {
+  const p = FX_PRESETS[+$("#fxPreset").value];
+  if (p) $("#fxDesc").textContent = p.description + ` · ${p.chain.length} 个效果器`;
+});
+
+const EDIT_FIELDS = {
+  gain: () => `
+    <label class="field inline">增益 (dB)
+      <input type="number" id="efGain" value="-3" step="0.5" min="-30" max="30" style="width:90px"/>
+    </label>`,
+  normalize: () => `<span class="faint small">峰值归一化到 0.99（每个文件独立扫描峰值）</span>`,
+  fade: () => `
+    <label class="field inline">淡入 (s) <input type="number" id="efIn" value="1" min="0" step="0.1" style="width:80px"/></label>
+    <label class="field inline">淡出 (s) <input type="number" id="efOut" value="1" min="0" step="0.1" style="width:80px"/></label>`,
+  silence: () => `
+    <label class="field inline">起点 (s) <input type="number" id="efStart" value="0" min="0" step="0.1" style="width:80px"/></label>
+    <label class="field inline">终点 (s) <input type="number" id="efEnd" value="1" min="0" step="0.1" style="width:80px"/></label>
+    <span class="faint small">相对于每个文件开头</span>`,
+  reverse: () => `<span class="faint small">整个文件倒放</span>`,
+};
+function renderEditFields() {
+  $("#editFields").innerHTML = EDIT_FIELDS[$("#editOp").value]();
+}
+$("#editOp").addEventListener("change", renderEditFields);
+renderEditFields();
+loadPresets();
+
+function buildBatchRequest() {
+  const op = $("#batchOp").value;
+  const params = {};
+  if (op === "effects") {
+    const p = FX_PRESETS[+$("#fxPreset").value];
+    if (!p) throw new Error("请选择效果链预设");
+    params.chain = p.chain;
+  } else if (op === "export") {
+    params.format = $("#expFmt").value;
+    params.sample_rate = $("#expSr").value ? +$("#expSr").value : null;
+    params.bit_depth = $("#expBits").value;
+    params.channels = $("#expCh").value ? +$("#expCh").value : null;
+  } else {
+    params.edit_op = $("#editOp").value;
+    const ep = {};
+    if (params.edit_op === "gain") ep.gain_db = +$("#efGain").value;
+    if (params.edit_op === "fade") {
+      ep.fade_in = +$("#efIn").value; ep.fade_out = +$("#efOut").value;
+    }
+    if (params.edit_op === "silence") {
+      ep.start = +$("#efStart").value; ep.end = +$("#efEnd").value;
+    }
+    params.edit_params = ep;
+  }
+  return { op, params, file_ids: [...SELECTED] };
+}
+
+/* ------------------------------------------------------------- batch jobs */
+
+let ACTIVE_JOB = null;
+let JOB_TIMER = null;
+let lastSucceeded = -1;
+
+const STATUS_TEXT = {
+  queued: "等待中", running: "处理中", success: "成功",
+  failed: "失败", cancelled: "已取消",
+};
+const STATUS_CLS = {
+  queued: "neutral", running: "", success: "green",
+  failed: "red", cancelled: "neutral",
+};
+
+$("#startBatch").addEventListener("click", async () => {
+  if (ACTIVE_JOB) return toast("已有批量任务在进行", "warn");
+  if (!SELECTED.size) return toast("请先勾选文件", "warn");
+  let body;
+  try { body = buildBatchRequest(); }
+  catch (e) { return toast(e.message, "warn"); }
+
+  const btn = $("#startBatch");
+  btn.disabled = true;
+  try {
+    const job = await API.post("/api/batch", body);
+    bindJob(job);
+  } catch (e) {
+    toast("无法创建批量任务: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("#cancelJob").addEventListener("click", async () => {
+  if (!ACTIVE_JOB) return;
+  $("#cancelJob").disabled = true;
+  try {
+    await API.post(`/api/batch/${ACTIVE_JOB.id}/cancel`);
+    toast("已请求取消：完成的保留，未完成的不会产生半成品", "warn");
+  } catch (e) { toast(e.message, "error"); }
+});
+
+$("#dismissJob").addEventListener("click", async () => {
+  if (ACTIVE_JOB) {
+    try { await API.del("/api/batch/" + ACTIVE_JOB.id); } catch (_) {}
+  }
+  $("#jobCard").classList.add("hidden");
+  ACTIVE_JOB = null;
+  clearInterval(JOB_TIMER); JOB_TIMER = null;
+});
+
+function bindJob(job) {
+  ACTIVE_JOB = job;
+  lastSucceeded = job.succeeded;
+  $("#jobCard").classList.remove("hidden");
+  $("#dismissJob").classList.add("hidden");
+  $("#cancelJob").classList.remove("hidden");
+  $("#cancelJob").disabled = false;
+  renderJob(job, true);
+  clearInterval(JOB_TIMER);
+  JOB_TIMER = setInterval(pollJob, 700);
+  pollJob();
+}
+
+async function pollJob() {
+  if (!ACTIVE_JOB) return;
+  try {
+    const job = await API.get("/api/batch/" + ACTIVE_JOB.id);
+    renderJob(job);
+  } catch (e) { /* keep polling on transient errors */ }
+}
+
+function renderJob(job, quiet = false) {
+  ACTIVE_JOB = job;
+  $("#jobOpBadge").textContent = job.op_label || job.op;
+  $("#jobBar").style.width = (job.progress * 100).toFixed(1) + "%";
+  const terminal = job.status === "done" || job.status === "cancelled";
+  $("#jobSummary").textContent =
+    `共 ${job.total} · 成功 ${job.succeeded} · 失败 ${job.failed}` +
+    (job.cancelled_count ? ` · 取消 ${job.cancelled_count}` : "") +
+    (job.running ? ` · 处理中 ${job.running}` : job.queued ? ` · 等待 ${job.queued}` : "");
+
+  $("#jobItems").innerHTML = job.items.map(it => {
+    const pct = (it.progress * 100).toFixed(0);
+    const badge = `<span class="badge ${STATUS_CLS[it.status] || ""}">${STATUS_TEXT[it.status] || it.status}</span>`;
+    const result = it.result
+      ? `<a href="${API.fileUrl(it.result.id)}" target="_blank" title="${esc(it.result.name)}">查看结果 ↗</a>`
+      : "";
+    const err = it.error ? `<div class="bi-error" title="${esc(it.error)}">⚠ ${esc(it.error)}</div>` : "";
+    return `
+      <div class="batch-item ${it.status}">
+        <span class="bi-name" title="${esc(it.name)}">${esc(it.name)}</span>
+        ${badge}
+        <span class="bi-progress"><span style="width:${pct}%"></span></span>
+        <span class="bi-result">${result}</span>
+        ${err}
+      </div>`;
+  }).join("");
+
+  if (terminal) {
+    clearInterval(JOB_TIMER); JOB_TIMER = null;
+    $("#cancelJob").classList.add("hidden");
+    $("#dismissJob").classList.remove("hidden");
+    if (quiet) return;  // restored after reload: show state, no toast/reload
+    // Newly finished files joined the library — refresh (selection preserved).
+    if (job.succeeded !== lastSucceeded) load();
+    lastSucceeded = job.succeeded;
+    if (job.failed > 0) {
+      toast(`批量任务结束：${job.succeeded} 成功，${job.failed} 失败（失败原因见列表）`, "warn", 6000);
+    } else if (job.status === "cancelled") {
+      toast(`任务已取消：${job.succeeded} 个完成的结果已保留`, "warn");
+    } else {
+      toast(`批量任务完成：${job.succeeded} 个文件已处理并入库`, "success");
+    }
+  }
+}
+
+// Restore the most recent job into the panel after a page reload.
+(async function restore() {
+  try {
+    const jobs = await API.get("/api/batch");
+    const j = jobs[0];
+    if (j && (j.status === "running" || j.status === "done" || j.status === "cancelled")) {
+      if (j.status === "running") bindJob(j);
+      else { ACTIVE_JOB = j; renderJob(j, true); }
+    }
+  } catch (_) {}
+})();
 
 load();
 </script>

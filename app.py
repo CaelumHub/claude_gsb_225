@@ -22,7 +22,7 @@ from typing import Dict, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import analysis, audio_io, batch, chords, effects, mixer, realtime, separation, storage
 
 try:
     from flask_cors import CORS
@@ -41,6 +41,11 @@ if _CORS:
 
 store = storage.Storage(DATA_DIR)
 rt = realtime.new_analyzer()
+
+# Batch-processing queue: sequential background worker, outputs staged in a
+# private temp dir and only moved into the library on success.
+BATCH_TMP = os.path.join(tempfile.gettempdir(), "audio-mir-batch")
+batches = batch.BatchManager(BATCH_TMP)
 
 
 # --------------------------------------------------------------------------- #
@@ -305,8 +310,15 @@ def api_samples(file_id: str):
 # Waveform edits
 # --------------------------------------------------------------------------- #
 
-def _apply_edit(src_path: str, dst_path: str, op: str, params: Dict) -> None:
+def _apply_edit(src_path: str, dst_path: str, op: str, params: Dict,
+                on_progress=None, is_cancelled=None) -> None:
     """Streaming waveform edit: trim / silence / fade / gain / normalize / reverse."""
+    from backend.audio_io import ProcessingCancelled
+
+    def _tick():
+        if is_cancelled and is_cancelled():
+            raise ProcessingCancelled("cancelled")
+
     with audio_io.WavReader(src_path) as r:
         sr = r.sr
         ch = r.channels
@@ -314,11 +326,19 @@ def _apply_edit(src_path: str, dst_path: str, op: str, params: Dict) -> None:
 
         if op == "reverse":
             bufs = [[] for _ in range(ch)]
+            done = 0
             for chunk in r.iter_chunks():
+                _tick()
                 for c, ch_data in enumerate(chunk):
                     bufs[c].extend(ch_data)
+                done += len(chunk[0])
+                if on_progress:
+                    on_progress(min(0.99, done / max(1, total)))
+            _tick()
             with audio_io.WavWriter(dst_path, sr, ch, 2) as w:
                 w.write_chunk([b[::-1] for b in bufs])
+            if on_progress:
+                on_progress(1.0)
             return
 
         start_f = int(float(params.get("start", 0)) * sr)
@@ -330,22 +350,29 @@ def _apply_edit(src_path: str, dst_path: str, op: str, params: Dict) -> None:
         fade_in = float(params.get("fade_in", 0)) * sr
         fade_out = float(params.get("fade_out", 0)) * sr
 
-        # Normalise needs a peak pre-scan.
+        # Normalise needs a peak pre-scan (first ~20% of the progress budget).
         if op == "normalize":
             peak = 0.0
+            scanned = 0
             with audio_io.WavReader(src_path) as rr:
                 for chunk in rr.iter_chunks():
+                    _tick()
                     for c in chunk:
                         for v in c:
                             a = abs(v)
                             if a > peak:
                                 peak = a
+                    scanned += len(chunk[0])
+                    if on_progress:
+                        on_progress(0.2 * min(1.0, scanned / max(1, total)))
             gain = (float(params.get("peak", 0.99)) / peak) if peak > 1e-9 else 1.0
             op = "gain"
 
+        done = 0
         with audio_io.WavWriter(dst_path, sr, ch, 2) as w:
             pos = 0
             while True:
+                _tick()
                 chunk = r.read_chunk(1 << 16)
                 if chunk is None:
                     break
@@ -373,6 +400,11 @@ def _apply_edit(src_path: str, dst_path: str, op: str, params: Dict) -> None:
                     out.append(o)
                 w.write_chunk(out)
                 pos += n
+                done += n
+                if on_progress:
+                    on_progress(min(0.99, done / max(1, total)))
+        if on_progress:
+            on_progress(1.0)
         return
 
 
@@ -650,6 +682,187 @@ def _probe(path: str, fmt: str):
         return int(st.get("sample_rate", 0) or 0), int(st.get("channels", 0) or 0), 0, dur, size
     except Exception:
         return 0, 0, 0, 0.0, size
+
+
+# --------------------------------------------------------------------------- #
+# Batch processing
+# --------------------------------------------------------------------------- #
+
+BATCH_OPS = ("effects", "export", "edit")
+EDIT_OPS = ("gain", "normalize", "fade", "silence", "reverse")
+EXPORT_FORMATS = ("wav", "aiff", "raw", "mp3", "ogg", "flac", "m4a")
+
+
+def _batch_runner(op: str, params: Dict):
+    """Build the streaming renderer closure for one batch operation."""
+
+    def run(item: Dict, out_path: str, on_progress, is_cancelled) -> None:
+        entry = store.get_file(item["file_id"])
+        if not entry:
+            raise FileNotFoundError("源文件已从音频库删除")
+        src = _abs_path(entry)
+        if not os.path.isfile(src):
+            raise FileNotFoundError("源音频文件丢失")
+        if op == "effects":
+            effects.apply_chain_to_file(src, out_path, params.get("chain", []),
+                                        on_progress=on_progress,
+                                        is_cancelled=is_cancelled)
+        elif op == "edit":
+            _apply_edit(src, out_path, params.get("edit_op", "gain"),
+                        params.get("edit_params", {}),
+                        on_progress=on_progress, is_cancelled=is_cancelled)
+        elif op == "export":
+            audio_io.convert(
+                src, out_path, params.get("format", "wav"),
+                dst_sr=params.get("sample_rate"),
+                sample_width=params.get("bit_depth", "pcm16"),
+                channels=params.get("channels"),
+                bitrate=params.get("bitrate", "192k"),
+                on_progress=on_progress, is_cancelled=is_cancelled)
+
+    return run
+
+
+def _batch_register(op: str, params: Dict):
+    """Move a successfully rendered output into the library and index it."""
+
+    def register(item: Dict, out_path: str) -> Dict:
+        entry = store.get_file(item["file_id"])
+        if not entry:
+            raise FileNotFoundError("源文件已从音频库删除")
+        src_name = entry.get("name", "audio")
+        stem = src_name.rsplit(".", 1)[0] if "." in src_name else src_name
+
+        if op == "export":
+            fmt = params.get("format", "wav")
+            file_id_new = storage.new_id()
+            dst = os.path.join(store.audio_dir, file_id_new + "." + fmt)
+            shutil.move(out_path, dst)
+            sr, ch, frames, duration, size = _probe(dst, fmt)
+            return store.add_file({
+                "id": file_id_new,
+                "name": f"{stem}.{fmt}",
+                "original_format": fmt,
+                "path": f"audio/{file_id_new}.{fmt}",
+                "sr": sr, "channels": ch, "frames": frames,
+                "duration": duration, "size_bytes": size,
+                "derived_from": entry["id"],
+                "exported": True,
+                "batch": True,
+            })
+
+        extra = {"batch": True}
+        if op == "effects":
+            name = params.get("name") or f"fx-{src_name}"
+            extra["effects"] = params.get("chain", [])
+        else:
+            edit_op = params.get("edit_op", "gain")
+            name = params.get("name") or f"{edit_op}-{src_name}"
+            extra["op"] = edit_op
+        return _register_derived(entry["id"], name, out_path, extra)
+
+    return register
+
+
+@app.post("/api/batch")
+def api_batch_create():
+    data = request.get_json(force=True) or {}
+    op = data.get("op")
+    if op not in BATCH_OPS:
+        return jsonify(error=f"未知操作类型（支持: {', '.join(BATCH_OPS)}）"), 400
+
+    file_ids = data.get("file_ids") or []
+    if not isinstance(file_ids, list) or not file_ids:
+        return jsonify(error="请至少选择一个文件"), 400
+    if len(file_ids) > 200:
+        return jsonify(error="单次批量任务最多 200 个文件"), 400
+
+    sources = []
+    seen = set()
+    for fid in file_ids:
+        if fid in seen:
+            continue
+        seen.add(fid)
+        e = store.get_file(fid)
+        if e:
+            sources.append(e)
+    if not sources:
+        return jsonify(error="所选文件均不存在（可能已被删除）"), 400
+
+    params = data.get("params") or {}
+
+    if op == "effects":
+        chain = params.get("chain")
+        if not isinstance(chain, list) or not chain:
+            return jsonify(error="请选择一条效果链"), 400
+        # Validate the chain up-front so the whole job doesn't fail per item.
+        try:
+            effects.EffectChain(chain, 44100)
+        except Exception as e:
+            return jsonify(error=f"效果链无效: {e}"), 400
+        op_label = "应用效果链"
+
+    elif op == "edit":
+        edit_op = params.get("edit_op")
+        if edit_op not in EDIT_OPS:
+            return jsonify(error=f"不支持的编辑操作（支持: {', '.join(EDIT_OPS)}）"), 400
+        ep = params.get("edit_params") or {}
+        try:
+            if edit_op in ("gain",):
+                float(ep.get("gain_db", 0))
+            if edit_op == "fade":
+                if float(ep.get("fade_in", 0)) < 0 or float(ep.get("fade_out", 0)) < 0:
+                    raise ValueError("淡入淡出时长不能为负")
+            if edit_op == "silence":
+                float(ep.get("start", 0))
+                float(ep.get("end", 1))
+        except (TypeError, ValueError) as e:
+            return jsonify(error=f"编辑参数无效: {e}"), 400
+        op_label = {"gain": "增益调整", "normalize": "响度归一化",
+                    "fade": "淡入淡出", "silence": "区间静音",
+                    "reverse": "倒放"}.get(edit_op, "编辑")
+
+    else:  # export
+        fmt = params.get("format", "wav")
+        if fmt not in EXPORT_FORMATS:
+            return jsonify(error=f"不支持的导出格式（支持: {', '.join(EXPORT_FORMATS)}）"), 400
+        if fmt not in ("wav", "raw") and not audio_io.has_ffmpeg():
+            return jsonify(error="该格式需要 ffmpeg，服务器当前未安装"), 400
+        op_label = f"导出为 {fmt.upper()}"
+
+    job = batches.create_job(op, params, sources,
+                             _batch_runner(op, params),
+                             _batch_register(op, params),
+                             op_label=op_label)
+    return jsonify(job), 201
+
+
+@app.get("/api/batch")
+def api_batch_list():
+    return jsonify(batches.list_jobs())
+
+
+@app.get("/api/batch/<job_id>")
+def api_batch_get(job_id: str):
+    job = batches.get_job(job_id)
+    if not job:
+        return jsonify(error="batch job not found"), 404
+    return jsonify(job)
+
+
+@app.post("/api/batch/<job_id>/cancel")
+def api_batch_cancel(job_id: str):
+    job = batches.cancel(job_id)
+    if not job:
+        return jsonify(error="batch job not found"), 404
+    return jsonify(job)
+
+
+@app.delete("/api/batch/<job_id>")
+def api_batch_dismiss(job_id: str):
+    if not batches.dismiss(job_id):
+        return jsonify(error="任务不存在或仍在进行"), 404
+    return jsonify(ok=True)
 
 
 # --------------------------------------------------------------------------- #
